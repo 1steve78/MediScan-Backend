@@ -25,7 +25,7 @@ logger = logging.getLogger("MediScan-Ai-Backend")
 app = FastAPI(
     title="MediScan-Ai Clinical Intelligence API",
     description="FastAPI clinical backend services featuring LangChain + Gemini 1.5 Flash Vision diagnostic pipelines.",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 # CORS configuration to seamlessly accept incoming requests from the frontend client
@@ -98,11 +98,17 @@ class MedicalReportExtraction(BaseModel):
         description="Clean list of prescribed medications, including drug names, exact dosages, frequencies, and directions. Return an empty list if none are mentioned."
     )
 
+class MedicalSummaryPoints(BaseModel):
+    summary_bullets: List[str] = Field(
+        description="A list of exactly 3 to 5 short, easily digestible clinical bullet points. Must be highly scannable (under 5 seconds) and avoid complex medical jargon, translating clinical insights into plain layman terms."
+    )
+
 class AnalyzeResponse(BaseModel):
     patient_name: str
     extracted_vitals: Dict[str, str]
     diagnoses: List[str]
     prescribed_medications: List[str]
+    summary: List[str]  # 3-5 patient-friendly bullet points (chained summarization)
     confidence_score: float
     pipeline_mode: str  # 'live_gemini_vision' or 'simulated_fallback'
     status: str = "success"
@@ -199,63 +205,81 @@ def get_simulated_triage(symptoms: str, language: str) -> TriageResponse:
     )
 
 
-def get_simulated_clinical_extraction(url: str) -> MedicalReportExtraction:
+def get_simulated_clinical_extraction(url: str) -> Dict[str, Any]:
     """
     High-fidelity clinical extraction simulator. Evaluates the filename keywords
-    and returns perfectly structured Pydantic payloads to prevent live demonstration failures.
+    and returns perfectly structured dictionary payloads featuring both primary 
+    extraction fields and localized 3-5 bullet point summaries to prevent live demonstration failures.
     """
     url_lower = url.lower()
     logger.info("Executing High-Fidelity Clinical Simulator Mode extraction...")
     
     if "brain" in url_lower or "mri" in url_lower:
-        return MedicalReportExtraction(
-            patient_name="Alexander Vance",
-            extracted_vitals={
+        return {
+            "patient_name": "Alexander Vance",
+            "extracted_vitals": {
                 "HR": "72 bpm",
                 "Temp": "98.6 F",
                 "BP": "120/80 mmHg"
             },
-            diagnoses=[
+            "diagnoses": [
                 "Normal ventricular size and configurations.",
                 "Mild chronic microvascular ischemic white matter changes.",
                 "No acute intracranial hemorrhage or mass effect."
             ],
-            prescribed_medications=[
+            "prescribed_medications": [
                 "Donepezil 5mg - 1 tablet orally daily at bedtime",
                 "Vitamin B-Complex - 1 capsule orally daily with meals"
+            ],
+            "summary": [
+                "Brain structure is normal with no signs of stroke, hemorrhage, or fluid buildup.",
+                "Mild chronic spots identified, reflecting normal minor wear on small blood vessels.",
+                "emp-medication is prescribed daily to support brain health and cognitive parameters.",
+                "We recommend a scheduled follow-up MRI in six months."
             ]
-        )
+        }
     elif "chest" in url_lower or "xray" in url_lower or "lung" in url_lower:
-        return MedicalReportExtraction(
-            patient_name="Clara Oswald",
-            extracted_vitals={
+        return {
+            "patient_name": "Clara Oswald",
+            "extracted_vitals": {
                 "BP": "118/76 mmHg",
                 "HR": "84 bpm",
                 "SpO2": "94%"
             },
-            diagnoses=[
+            "diagnoses": [
                 "Acute left-sided lobar pneumonia with consolidation.",
                 "Mild pleural effusion in the left hemithorax.",
                 "Normal cardiomediastinal silhouette shape."
             ],
-            prescribed_medications=[
+            "prescribed_medications": [
                 "Amoxicillin-Clavulanate 875/125mg - 1 tablet orally every 12 hours for 7 days",
                 "Albuterol HFA Inhaler - 2 puffs every 4-6 hours as needed for shortness of breath"
+            ],
+            "summary": [
+                "Left-sided lung infection (pneumonia) and minor fluid accumulation detected.",
+                "Heart structure and major airways are completely healthy and normally shaped.",
+                "Strong oral antibiotic therapy is prescribed to target and eliminate the infection.",
+                "An inhaler is provided as-needed to assist with breathing; follow-up X-ray recommended in 2 weeks."
             ]
-        )
+        }
     else:
-        return MedicalReportExtraction(
-            patient_name="Jane Doe",
-            extracted_vitals={
+        return {
+            "patient_name": "Jane Doe",
+            "extracted_vitals": {
                 "BP": "120/80 mmHg",
                 "HR": "70 bpm"
             },
-            diagnoses=[
+            "diagnoses": [
                 "Unremarkable radiological parameters.",
                 "No active localized pathology detected in target tissues."
             ],
-            prescribed_medications=[]
-        )
+            "prescribed_medications": [],
+            "summary": [
+                "All radiological parameters are completely healthy and within normal boundaries.",
+                "No active infections, structural wear, or tumors detected.",
+                "No medications prescribed; maintain general hydration and wellness checks."
+            ]
+        }
 
 
 # --- EXCEPTION HANDLERS (Crash Prevention) ---
@@ -402,9 +426,10 @@ async def post_triage(payload: TriageRequest):
 @app.post("/api/analyze-report", response_model=AnalyzeResponse, status_code=status.HTTP_200_OK)
 async def post_analyze_report(payload: AnalyzeRequest):
     """
-    Multimodal Report Analysis Pipeline:
-    Downloads the medical document image, passes it to a strict LangChain 
-    structured extraction prompt template powered by Gemini 1.5 Flash Vision.
+    Multimodal Report Analysis Pipeline (Task 1 & Task 3):
+    Downloads the medical document image, extracts structured data (Chain 1), 
+    and chains the output to a secondary summarizer model (Chain 2) generating 
+    exactly 3 to 5 layman-friendly, highly scannable bullet points.
     Fails safely using a high-fidelity simulator mode if credentials are empty.
     """
     logger.info(f"Report analysis request received for file: '{payload.file_url}'")
@@ -417,12 +442,13 @@ async def post_analyze_report(payload: AnalyzeRequest):
 
     # Use simulated fallback if API key is not configured
     if not GEMINI_API_KEY:
-        simulated_data = get_simulated_clinical_extraction(payload.file_url)
+        sim = get_simulated_clinical_extraction(payload.file_url)
         return AnalyzeResponse(
-            patient_name=simulated_data.patient_name,
-            extracted_vitals=simulated_data.extracted_vitals,
-            diagnoses=simulated_data.diagnoses,
-            prescribed_medications=simulated_data.prescribed_medications,
+            patient_name=sim["patient_name"],
+            extracted_vitals=sim["extracted_vitals"],
+            diagnoses=sim["diagnoses"],
+            prescribed_medications=sim["prescribed_medications"],
+            summary=sim["summary"],
             confidence_score=0.95,
             pipeline_mode="simulated_fallback"
         )
@@ -444,11 +470,11 @@ async def post_analyze_report(payload: AnalyzeRequest):
             temperature=0.1
         )
         
-        # Force strict structured Pydantic extraction from Gemini
+        # --- CHAIN 1: STRUCTURAL MEDICAL EXTRACTION ---
+        logger.info("Executing Chain 1: Structured Medical Extraction...")
         structured_llm = llm.with_structured_output(MedicalReportExtraction)
         
-        # Construct the extraction prompt
-        system_prompt = (
+        system_prompt_extract = (
             "You are an expert medical data extraction assistant and radiologist.\n"
             "Your objective is to inspect the uploaded medical scan, lab report, or prescription sheet, "
             "and extract all relevant details into the requested structured JSON format.\n"
@@ -461,9 +487,8 @@ async def post_analyze_report(payload: AnalyzeRequest):
             "6. If the image is completely illegible or unrelated to medical files, raise a clinical warning in the diagnoses and return empty parameters for other fields."
         )
         
-        # Pack multimodal prompt using OpenAI/LangChain standards
-        messages = [
-            ("system", system_prompt),
+        messages_extract = [
+            ("system", system_prompt_extract),
             HumanMessage(
                 content=[
                     {"type": "text", "text": "Analyze this medical document and extract all clinical metrics."},
@@ -475,15 +500,50 @@ async def post_analyze_report(payload: AnalyzeRequest):
             )
         ]
         
-        logger.info("Invoking Gemini 1.5 Flash Vision clinical chain...")
-        extracted_data: MedicalReportExtraction = await structured_llm.ainvoke(messages)
+        extracted_data: MedicalReportExtraction = await structured_llm.ainvoke(messages_extract)
+        logger.info(f"Chain 1 complete. Extracted patient: '{extracted_data.patient_name}'")
         
-        logger.info(f"Extraction successful! Patient: '{extracted_data.patient_name}'")
+        # --- CHAIN 2: CLINICAL SUMMARIZATION (Task 3) ---
+        logger.info("Executing Chain 2: Secondary Layman Summarization...")
+        summarize_llm = llm.with_structured_output(MedicalSummaryPoints)
+        
+        system_prompt_summarize = (
+            "You are an expert clinical communications specialist and medical translator.\n"
+            "Your task is to take a detailed, structured medical extraction JSON and translate it into a "
+            "patient-friendly, highly empathetic, and scannable clinical summary.\n"
+            "Follow these guidelines strictly:\n"
+            "1. Output a list of exactly 3 to 5 short, concise bullet points.\n"
+            "2. Translate complex medical terminology into clear, simple layman terms (e.g. explain what white matter changes, consolidations, or pleural effusions mean practically in plain, calm English).\n"
+            "3. Optimize the text so it can be scanned and understood in under 5 seconds by busy medical staff or anxious patients.\n"
+            "4. Do NOT include any conversational text, introductions, or structural metadata. Output only the bullet points conforming strictly to the MedicalSummaryPoints schema."
+        )
+        
+        prompt_summarize = ChatPromptTemplate.from_messages([
+            ("system", system_prompt_summarize),
+            ("human", "Summarize this clinical extraction data in simple patient-friendly terms:\n'{extraction_json}'")
+        ])
+        
+        summarize_chain = prompt_summarize | summarize_llm
+        summary_result: MedicalSummaryPoints = await summarize_chain.ainvoke({
+            "extraction_json": extracted_data.model_dump_json()
+        })
+        
+        logger.info(f"Chain 2 Summarization complete. Bullets generated: {len(summary_result.summary_bullets)}")
+        
+        # Ensure 3-5 bullets restriction is met
+        bullets = summary_result.summary_bullets
+        if len(bullets) < 3:
+            bullets.append("Monitor clinical symptoms closely and report any new developments.")
+            bullets.append("Follow up with your primary physician as scheduled.")
+        elif len(bullets) > 5:
+            bullets = bullets[:5]
+            
         return AnalyzeResponse(
             patient_name=extracted_data.patient_name,
             extracted_vitals=extracted_data.extracted_vitals,
             diagnoses=extracted_data.diagnoses,
             prescribed_medications=extracted_data.prescribed_medications,
+            summary=bullets,
             confidence_score=0.98,
             pipeline_mode="live_gemini_vision"
         )
@@ -493,12 +553,13 @@ async def post_analyze_report(payload: AnalyzeRequest):
         logger.warning("Failing over to High-Fidelity Clinical Simulator Mode to prevent frontend API failure.")
         
         # Trigger safe failover fallback
-        simulated_data = get_simulated_clinical_extraction(payload.file_url)
+        sim = get_simulated_clinical_extraction(payload.file_url)
         return AnalyzeResponse(
-            patient_name=simulated_data.patient_name,
-            extracted_vitals=simulated_data.extracted_vitals,
-            diagnoses=simulated_data.diagnoses,
-            prescribed_medications=simulated_data.prescribed_medications,
+            patient_name=sim["patient_name"],
+            extracted_vitals=sim["extracted_vitals"],
+            diagnoses=sim["diagnoses"],
+            prescribed_medications=sim["prescribed_medications"],
+            summary=sim["summary"],
             confidence_score=0.88,
             pipeline_mode="simulated_fallback"
         )
