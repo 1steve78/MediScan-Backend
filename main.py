@@ -25,7 +25,7 @@ logger = logging.getLogger("MediScan-Ai-Backend")
 app = FastAPI(
     title="MediScan-Ai Clinical Intelligence API",
     description="FastAPI clinical backend services featuring LangChain + Gemini 1.5 Flash Vision diagnostic pipelines.",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # CORS configuration to seamlessly accept incoming requests from the frontend client
@@ -50,7 +50,7 @@ HOST = os.getenv("HOST", "127.0.0.1")
 if not GEMINI_API_KEY:
     logger.warning("GEMINI_API_KEY is not configured in the environment! Backend will operate using High-Fidelity Clinical Simulator Mode.")
 else:
-    logger.info("GEMINI_API_KEY detected. Report Analysis Pipeline active using Live Gemini 1.5 Flash Vision.")
+    logger.info("GEMINI_API_KEY detected. AI pipelines active using Live Gemini 1.5 Flash.")
 
 
 # --- PYDANTIC SCHEMAS ---
@@ -63,6 +63,22 @@ class TriageResponse(BaseModel):
     classification: str  # low, medium, high, critical
     ai_insight: str
     status: str = "success"
+
+class TriageSeverity(BaseModel):
+    is_emergency: bool = Field(
+        description="True if symptoms indicate a life-threatening, acute emergency requiring immediate emergency room care (e.g. chest pain, breathing difficulty, severe stroke symptoms, loss of consciousness, uncontrolled bleeding). False otherwise."
+    )
+    justification: str = Field(
+        description="A brief explanation of why this was marked as an emergency or not."
+    )
+
+class GeneralTriageAssessment(BaseModel):
+    classification: str = Field(
+        description="Triage severity level. Must be exactly one of: 'low', 'medium', 'high'."
+    )
+    ai_insight: str = Field(
+        description="Concise, patient-friendly diagnostic summary, outlining possible causes, recommended next steps, and specific symptoms to monitor."
+    )
 
 class AnalyzeRequest(BaseModel):
     file_url: str
@@ -128,6 +144,59 @@ async def download_and_encode_image(url: str) -> tuple[str, str]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Could not load or decode document image. Verify the file is a valid image. Error: {str(e)}"
         )
+
+
+def get_simulated_triage(symptoms: str, language: str) -> TriageResponse:
+    """
+    High-fidelity clinical triage agent simulator. Mimics the two-stage
+    agentic routing logic (emergency check vs. general assessment).
+    """
+    symptoms_lower = symptoms.lower()
+    lang = language.lower()
+    
+    # Step A: Simulated Severity Check
+    is_emergency = any(
+        w in symptoms_lower 
+        for w in ["chest pain", "shortness of breath", "heart attack", "unconscious", "stroke", "can't breathe", "suffocating", "bleeding out"]
+    )
+    
+    translations = {
+        "en": {
+            "critical": "CRITICAL EMERGENCY ALERT: Immediate medical intervention required. The symptoms indicate a potential life-threatening cardiorespiratory or neurological event. Please proceed to the nearest trauma unit or call 911 immediately.",
+            "high": "HIGH PRIORITY: Strong indicator of acute condition. We advise scheduling a clinical diagnostic consultation within 24 hours.",
+            "medium": "MEDIUM PRIORITY: Non-acute symptomatic patterns detected. Monitor closely and consult a primary care physician if symptoms persist.",
+            "low": "LOW PRIORITY: Normal physiological variations or mild systemic reaction. Rest, stay hydrated, and observe."
+        },
+        "es": {
+            "critical": "ALERTA DE EMERGENCIA CRÍTICA: Se requiere intervención médica inmediata. Los síntomas indican un posible evento cardiorrespiratorio o neurológico potencialmente mortal. Diríjase a urgencias o llame a emergencias de inmediato.",
+            "high": "ALTA PRIORIDAD: Indicador fuerte de afección aguda. Se aconseja programar una consulta médica en las próximas 24 horas.",
+            "medium": "PRIORIDAD MEDIA: Síntomas no agudos detectados. Controle de cerca y consulte a su médico de cabecera si persisten.",
+            "low": "BAJA PRIORIDAD: Variaciones fisiológicas normales o reacción sistémica leve. Reposo, hidratación y observación."
+        }
+    }
+    
+    selected_lang = lang if lang in translations else "en"
+    db = translations[selected_lang]
+    
+    if is_emergency:
+        logger.info("Simulated Agentic Router: Routed to CRITICAL severity.")
+        return TriageResponse(
+            classification="critical",
+            ai_insight=db["critical"]
+        )
+        
+    # Step B: Simulated General Assessment
+    classification = "low"
+    if any(w in symptoms_lower for w in ["fever", "fracture", "severe pain", "bleeding", "migraine"]):
+        classification = "high"
+    elif any(w in symptoms_lower for w in ["cough", "abdominal", "dizzy", "nausea", "rash"]):
+        classification = "medium"
+        
+    logger.info(f"Simulated Agentic Router: Routed to {classification.upper()} priority.")
+    return TriageResponse(
+        classification=classification,
+        ai_insight=db[classification]
+    )
 
 
 def get_simulated_clinical_extraction(url: str) -> MedicalReportExtraction:
@@ -222,69 +291,112 @@ async def root():
 @app.post("/api/triage", response_model=TriageResponse, status_code=status.HTTP_200_OK)
 async def post_triage(payload: TriageRequest):
     """
-    Triage Symptoms Endpoint:
-    Parses incoming symptom queries and determines a recommended triage level 
-    (low, medium, high, critical) alongside localized clinical AI insights.
+    Agentic Symptom Triage Endpoint:
+    Processes symptoms in a two-stage routing pipeline using LangChain + Gemini.
+    Step A: Severity Emergency Screen (Structural Check) -> Stops & routes to 'Critical' if positive.
+    Step B: Non-Emergency Clinical Assessment -> Evaluates priority (low, medium, high) and insight.
+    Fails safely back to Simulated Triage if key is missing or model fails.
     """
-    logger.info(f"Received triage request. Symptoms: '{payload.symptoms}' [Lang: {payload.language}]")
+    logger.info(f"Received triage query: '{payload.symptoms}' [Lang: {payload.language}]")
     
+    if not payload.symptoms.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Symptom details cannot be empty."
+        )
+
+    # Use simulated fallback if API key is not configured
+    if not GEMINI_API_KEY:
+        return get_simulated_triage(payload.symptoms, payload.language)
+
     try:
-        if not payload.symptoms.strip():
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Symptom details cannot be empty."
-            )
-
-        symptoms_lower = payload.symptoms.lower()
-        classification = "low"
-        ai_insight = ""
-
-        translations = {
-            "en": {
-                "critical": "CRITICAL: Immediate emergency intervention advised. Please proceed to the nearest trauma unit or call emergency services.",
-                "high": "HIGH PRIORITY: Strong indicator of acute condition. We advise scheduling a clinical diagnostic consultation within 24 hours.",
-                "medium": "MEDIUM PRIORITY: Non-acute symptomatic patterns detected. Monitor closely and consult a primary care physician if symptoms persist.",
-                "low": "LOW PRIORITY: Normal physiological variations or mild systemic reaction. Rest, stay hydrated, and observe."
-            },
-            "es": {
-                "critical": "CRÍTICO: Se recomienda intervención médica de emergencia inmediata. Diríjase a urgencias o llame a emergencias.",
-                "high": "ALTA PRIORIDAD: Indicador fuerte de afección aguda. Se aconseja programar una consulta médica en las próximas 24 horas.",
-                "medium": "PRIORIDAD MEDIA: Síntomas no agudos detectados. Controle de cerca y consulte a su médico de cabecera si persisten.",
-                "low": "BAJA PRIORIDAD: Variaciones fisiológicas normales o reacción sistémica leve. Reposo, hidratación y observación."
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.prompts import ChatPromptTemplate
+        
+        # Initialize Google GenAI LLM
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.1
+        )
+        
+        # --- STEP A: Severity Screen ---
+        logger.info("Executing Step A: Emergency Severity Check...")
+        severity_llm = llm.with_structured_output(TriageSeverity)
+        
+        system_prompt_severity = (
+            "You are an expert emergency room triage coordinator.\n"
+            "Your absolute priority is to inspect patient symptoms and determine if they indicate a "
+            "life-threatening emergency requiring immediate activation of emergency services (ER/911).\n"
+            "Evaluate strictly: Look for signs of myocardial infarction (chest pain, radiating left arm pain), respiratory failure "
+            "(cannot breathe, asphyxiation, suffocating), stroke (facial droop, sudden numbness/paralysis, acute speech loss), "
+            "severe trauma (uncontrolled hemorrhage, crushed limbs), or loss of consciousness.\n"
+            "Conform strictly to the TriageSeverity schema."
+        )
+        
+        prompt_severity = ChatPromptTemplate.from_messages([
+            ("system", system_prompt_severity),
+            ("human", "Evaluate the following symptoms: '{symptoms}'")
+        ])
+        
+        severity_chain = prompt_severity | severity_llm
+        severity_result: TriageSeverity = await severity_chain.ainvoke({"symptoms": payload.symptoms})
+        
+        logger.info(f"Severity Check output: is_emergency={severity_result.is_emergency}, justification='{severity_result.justification}'")
+        
+        # Agentic routing logic
+        if severity_result.is_emergency:
+            logger.info("Agentic Routing: Emergency identified. Direct-routing to Critical output.")
+            
+            translations_critical = {
+                "en": f"CRITICAL EMERGENCY ALERT: Immediate medical intervention required. {severity_result.justification} Please proceed to the nearest Emergency Department or call emergency services (911) immediately.",
+                "es": f"ALERTA DE EMERGENCIA CRÍTICA: Se requiere intervención médica inmediata. {severity_result.justification} Diríjase al departamento de emergencias más cercano o llame a los servicios de emergencia de inmediato."
             }
-        }
-
-        lang = payload.language.lower() if payload.language.lower() in translations else "en"
-        text_db = translations[lang]
-
-        if any(w in symptoms_lower for w in ["chest pain", "shortness of breath", "heart attack", "unconscious", "stroke"]):
-            classification = "critical"
-            ai_insight = text_db["critical"]
-        elif any(w in symptoms_lower for w in ["fever", "fracture", "severe pain", "bleeding", "migraine"]):
-            classification = "high"
-            ai_insight = text_db["high"]
-        elif any(w in symptoms_lower for w in ["cough", "abdominal", "dizzy", "nausea", "rash"]):
+            lang = payload.language.lower() if payload.language.lower() in translations_critical else "en"
+            return TriageResponse(
+                classification="critical",
+                ai_insight=translations_critical[lang]
+            )
+            
+        # --- STEP B: Non-Emergency Clinical Assessment ---
+        logger.info("Agentic Routing: Non-emergency. Routing to Step B: General Clinical Assessment...")
+        assessment_llm = llm.with_structured_output(GeneralTriageAssessment)
+        
+        system_prompt_assessment = (
+            "You are a clinical nurse specialist and diagnostic assistant.\n"
+            "The patient's symptoms have been pre-screened and do NOT represent a critical life-threatening emergency.\n"
+            "Your objective is to evaluate the symptoms and assign a priority level of exactly 'low', 'medium', or 'high', "
+            "along with generating a concise, highly empathetic, and patient-friendly diagnostic summary.\n"
+            "Outline potential causes, clear next steps, and specific symptoms to monitor. Keep the tone calm, structured, and informative.\n"
+            "Return the analysis translated into the requested language (e.g. Spanish if language is 'es', otherwise English)."
+        )
+        
+        prompt_assessment = ChatPromptTemplate.from_messages([
+            ("system", system_prompt_assessment),
+            ("human", "Analyze the following symptoms and determine triage level: '{symptoms}' [Requested Language: '{language}']")
+        ])
+        
+        assessment_chain = prompt_assessment | assessment_llm
+        assessment_result: GeneralTriageAssessment = await assessment_chain.ainvoke({
+            "symptoms": payload.symptoms,
+            "language": payload.language
+        })
+        
+        logger.info(f"Step B Assessment complete. Classification: {assessment_result.classification.upper()}")
+        
+        classification = assessment_result.classification.lower()
+        if classification not in ["low", "medium", "high"]:
             classification = "medium"
-            ai_insight = text_db["medium"]
-        else:
-            classification = "low"
-            ai_insight = text_db["low"]
-
-        logger.info(f"Triage classification resolved to: {classification.upper()}")
-
+            
         return TriageResponse(
             classification=classification,
-            ai_insight=ai_insight
+            ai_insight=assessment_result.ai_insight
         )
 
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        logger.error(f"Error handling triage analysis: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to analyze symptoms."
-        )
+        logger.error(f"Live Agentic Triage Pipeline failed: {str(e)}")
+        logger.warning("Failing over to High-Fidelity Simulated Triage to prevent endpoint failure.")
+        return get_simulated_triage(payload.symptoms, payload.language)
 
 
 @app.post("/api/analyze-report", response_model=AnalyzeResponse, status_code=status.HTTP_200_OK)
