@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -27,8 +27,8 @@ logger = logging.getLogger("MediScan-Ai-Backend")
 
 app = FastAPI(
     title="MediScan-Ai Clinical Intelligence API",
-    description="Asynchronous event-driven clinical backend services powered by self-healing LangChain + Gemini 1.5 Flash pipelines with cryptographic Web3 document integrity hashes.",
-    version="2.1.0"
+    description="Asynchronous event-driven clinical backend services powered by self-healing LangChain + Gemini 1.5 Flash pipelines with cryptographic document integrity hashes.",
+    version="3.0.0"
 )
 
 # CORS configuration to seamlessly accept incoming requests from the frontend client
@@ -103,6 +103,23 @@ class AnalyzeQueuedResponse(BaseModel):
     status: str
     message: str
 
+class LabValue(BaseModel):
+    parameter: str = Field(
+        description="Name of the laboratory test, e.g. Hemoglobin, WBC, Sodium, TSH, HbA1c."
+    )
+    value: float = Field(
+        description="The extracted numerical reading from the report."
+    )
+    unit: str = Field(
+        description="Standard unit of measurement, e.g. g/dL, mg/dL, uIU/mL, %."
+    )
+    reference_range: str = Field(
+        description="Normal clinical reference range, e.g. '12.0 - 16.0', '4.5 - 11.0', '0.45 - 4.5'."
+    )
+    comparison: str = Field(
+        description="Evaluation of the reading against the reference range. Must be exactly one of: 'Low', 'Normal', 'High'."
+    )
+
 class MedicalReportExtraction(BaseModel):
     patient_name: str = Field(
         description="Full name of the patient. If the name is completely missing, return 'Unknown'."
@@ -117,6 +134,10 @@ class MedicalReportExtraction(BaseModel):
     prescribed_medications: List[str] = Field(
         description="Clean list of prescribed medications, including drug names, exact dosages, frequencies, and directions. Return an empty list if none are mentioned."
     )
+    lab_results: List[LabValue] = Field(
+        default_factory=list,
+        description="Structured laboratory values extracted from the report, incorporating a comparison of the value against standard clinical reference ranges (Low, Normal, High)."
+    )
 
 class MedicalSummaryPoints(BaseModel):
     summary_bullets: List[str] = Field(
@@ -128,9 +149,38 @@ class AnalyzeResponse(BaseModel):
     extracted_vitals: Dict[str, str]
     diagnoses: List[str]
     prescribed_medications: List[str]
+    lab_results: List[LabValue]  # Structured blood/lab readings (Feature Extraction upgrade)
     summary: List[str]  # 3-5 patient-friendly bullet points (chained summarization)
     confidence_score: float
     document_hash: str  # Web3 SHA-256 tamper-proof fingerprint of the original file
+    pipeline_mode: str  # 'live_gemini_vision' or 'simulated_fallback'
+    status: str = "success"
+
+class PrescriptionMedication(BaseModel):
+    drug_name: str = Field(
+        description="Name of the prescribed active compound/drug."
+    )
+    dosage: str = Field(
+        description="Dosage strength or volume, e.g. 500mg, 10ml, 5mcg."
+    )
+    frequency: str = Field(
+        description="Dosing frequency, e.g. Twice daily, Once a day at bedtime, Every 8 hours as needed."
+    )
+    duration: str = Field(
+        description="Recommended treatment duration, e.g. 7 days, 1 month, Chronic/Ongoing."
+    )
+    refills: int = Field(
+        description="Number of permitted refills. If not specified, return 0."
+    )
+    instructions: str = Field(
+        description="Special intake directions, e.g. Take with food, Avoid dairy, Avoid direct sunlight."
+    )
+
+class PrescriptionExtractionResponse(BaseModel):
+    patient_name: str
+    prescribing_doctor: str
+    medications: List[PrescriptionMedication]  # Array of verified medications (Dedicated Rx flow)
+    document_hash: str  # Web3 cryptographic security hash
     pipeline_mode: str  # 'live_gemini_vision' or 'simulated_fallback'
     status: str = "success"
 
@@ -186,7 +236,7 @@ async def invoke_with_retry_and_parsing(llm, prompt_messages, parser, max_retrie
                 f"Please review your formatting. Correct the JSON structure so it conforms exactly to "
                 f"these format instructions:\n"
                 f"{format_instructions}\n"
-                f"Output ONLY valid JSON. Avoid conversational prefixes, suffixes, or structural code wrappers."
+                f"Ensure you return ONLY valid JSON. Avoid conversational prefixes, suffixes, or structural code wrappers."
             )
             
             from langchain_core.messages import AIMessage, HumanMessage
@@ -239,7 +289,7 @@ async def update_supabase_record(job_id: str, clinical_data: dict):
     Supabase Sync Hook:
     Executes a PATCH request to update the record inside your Supabase 
     medical_records table where id = job_id. Maps extraction parameters seamlessly,
-    including the Web3 immutable document_hash.
+    including the Web3 immutable document_hash and structured lab_results.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         logger.info("Supabase sync variables not present. Skipping database synchronization.")
@@ -262,7 +312,8 @@ async def update_supabase_record(job_id: str, clinical_data: dict):
         "diagnoses": clinical_data.get("diagnoses"),
         "prescriptions": clinical_data.get("prescribed_medications"),
         "summary": clinical_data.get("summary"),
-        "document_hash": clinical_data.get("document_hash"), # IMMUTABLE LOGGING
+        "lab_results": clinical_data.get("lab_results"), # Sync structured lab tests
+        "document_hash": clinical_data.get("document_hash"), # Web3 Hashing
         "status": "completed",
         "confidence_score": clinical_data.get("confidence_score", 0.95)
     }
@@ -335,13 +386,31 @@ def get_simulated_clinical_extraction(url: str) -> Dict[str, Any]:
     """
     High-fidelity clinical extraction simulator. Evaluates the filename keywords
     and returns perfectly structured dictionary payloads featuring primary extraction fields,
-    localized 3-5 bullet point summaries, and simulated document integrity SHA-256 hashes.
+    localized 3-5 bullet point summaries, structured lab results with calculated comparisons,
+    and simulated document integrity SHA-256 hashes.
     """
     url_lower = url.lower()
     logger.info("Executing High-Fidelity Clinical Simulator Mode extraction...")
     
     # Generate stable mock hash based on filename URL
     simulated_hash = hashlib.sha256(url.encode()).hexdigest()
+    
+    # Define structured mock lab results
+    mri_labs = [
+        {"parameter": "Vitamin B12", "value": 180.0, "unit": "pg/mL", "reference_range": "200 - 900", "comparison": "Low"},
+        {"parameter": "TSH", "value": 2.4, "unit": "uIU/mL", "reference_range": "0.45 - 4.5", "comparison": "Normal"}
+    ]
+    
+    xray_labs = [
+        {"parameter": "WBC Count", "value": 14.8, "unit": "x10^3 / uL", "reference_range": "4.5 - 11.0", "comparison": "High"},
+        {"parameter": "Hemoglobin", "value": 13.8, "unit": "g/dL", "reference_range": "12.0 - 16.0", "comparison": "Normal"},
+        {"parameter": "CRP (C-Reactive Protein)", "value": 45.2, "unit": "mg/L", "reference_range": "0.0 - 5.0", "comparison": "High"}
+    ]
+    
+    default_labs = [
+        {"parameter": "Glucose (Fasting)", "value": 92.0, "unit": "mg/dL", "reference_range": "70 - 100", "comparison": "Normal"},
+        {"parameter": "Sodium", "value": 138.0, "unit": "mmol/L", "reference_range": "135 - 145", "comparison": "Normal"}
+    ]
     
     if "brain" in url_lower or "mri" in url_lower:
         return {
@@ -360,6 +429,7 @@ def get_simulated_clinical_extraction(url: str) -> Dict[str, Any]:
                 "Donepezil 5mg - 1 tablet orally daily at bedtime",
                 "Vitamin B-Complex - 1 capsule orally daily with meals"
             ],
+            "lab_results": mri_labs,
             "summary": [
                 "Brain structure is normal with no signs of stroke, hemorrhage, or fluid buildup.",
                 "Mild chronic spots identified, reflecting normal minor wear on small blood vessels.",
@@ -385,6 +455,7 @@ def get_simulated_clinical_extraction(url: str) -> Dict[str, Any]:
                 "Amoxicillin-Clavulanate 875/125mg - 1 tablet orally every 12 hours for 7 days",
                 "Albuterol HFA Inhaler - 2 puffs every 4-6 hours as needed for shortness of breath"
             ],
+            "lab_results": xray_labs,
             "summary": [
                 "Left-sided lung infection (pneumonia) and minor fluid accumulation detected.",
                 "Heart structure and major airways are completely healthy and normally shaped.",
@@ -405,6 +476,7 @@ def get_simulated_clinical_extraction(url: str) -> Dict[str, Any]:
                 "No active localized pathology detected in target tissues."
             ],
             "prescribed_medications": [],
+            "lab_results": default_labs,
             "summary": [
                 "All radiological parameters are completely healthy and within normal boundaries.",
                 "No active infections, structural wear, or tumors detected.",
@@ -414,30 +486,68 @@ def get_simulated_clinical_extraction(url: str) -> Dict[str, Any]:
         }
 
 
+def get_simulated_prescription_extraction(url: str) -> Dict[str, Any]:
+    """
+    High-fidelity simulated prescription extraction for dedicated pharmaceutical flows.
+    """
+    simulated_hash = hashlib.sha256(url.encode()).hexdigest()
+    return {
+        "patient_name": "Sarah Connor",
+        "prescribing_doctor": "Dr. Sarah Lawrence, MD",
+        "medications": [
+            {
+                "drug_name": "Metformin HCl",
+                "dosage": "500mg",
+                "frequency": "Twice daily",
+                "duration": "Chronic / Ongoing",
+                "refills": 3,
+                "instructions": "Take orally with morning and evening meals to reduce gastrointestinal upset."
+            },
+            {
+                "drug_name": "Lisinopril",
+                "dosage": "10mg",
+                "frequency": "Once daily",
+                "duration": "Chronic / Ongoing",
+                "refills": 5,
+                "instructions": "Take in the morning. Monitor blood pressure weekly."
+            }
+        ],
+        "document_hash": simulated_hash
+    }
+
+
 # --- BACKGROUND WORKER TASK ---
 
-async def run_report_analysis_task(job_id: str, file_url: str):
+async def run_report_analysis_task(job_id: str, file_url: Optional[str] = None, image_data: Optional[Dict[str, str]] = None):
     """
     Background Analysis Worker:
     Runs the complete self-healing double-chained clinical intelligence pipeline.
-    Saves state in local JOBS_DB cache and issues Supabase PATCH update on completion,
-    incorporating Web3 Cryptographic Document Integrity hashes.
+    Accepts EITHER a file_url (requires download) OR pre-loaded image_data dictionary
+    (containing encoded_image, mime_type, and file_hash) to avoid redundant downloads.
     """
-    logger.info(f"Background Worker starting job {job_id} for document: {file_url}")
+    logger.info(f"Background Worker starting job {job_id}...")
     JOBS_DB[job_id] = {"status": "processing", "result": None}
 
-    # If API Key is not configured, complete immediately using our high-fidelity simulator
+    # Verify input variables
+    if not file_url and not image_data:
+        JOBS_DB[job_id] = {"status": "failed", "error": "No document payload or URL provided."}
+        return
+
+    # Use simulated fallback if API Key is not configured
     if not GEMINI_API_KEY:
         try:
             import asyncio
             await asyncio.sleep(1.5)
-            sim_data = get_simulated_clinical_extraction(file_url)
+            # Use file_url or placeholder
+            ref_url = file_url if file_url else "uploaded_scan_report.jpg"
+            sim_data = get_simulated_clinical_extraction(ref_url)
             
             final_response = {
                 "patient_name": sim_data["patient_name"],
                 "extracted_vitals": sim_data["extracted_vitals"],
                 "diagnoses": sim_data["diagnoses"],
                 "prescribed_medications": sim_data["prescribed_medications"],
+                "lab_results": sim_data["lab_results"],
                 "summary": sim_data["summary"],
                 "document_hash": sim_data["document_hash"],
                 "confidence_score": 0.95,
@@ -463,8 +573,15 @@ async def run_report_analysis_task(job_id: str, file_url: str):
         from langchain_core.messages import HumanMessage
         from langchain_core.output_parsers import PydanticOutputParser
 
-        # Download report image, fetch raw buffer, and compute Web3 document hash
-        encoded_image, mime_type, file_hash = await download_and_encode_image(file_url)
+        # Fetch image bytes
+        if image_data:
+            logger.info(f"Job {job_id}: Processing using direct multipart uploaded buffer payload.")
+            encoded_image = image_data["encoded_image"]
+            mime_type = image_data["mime_type"]
+            file_hash = image_data["file_hash"]
+        else:
+            # Download and encode report image from URL
+            encoded_image, mime_type, file_hash = await download_and_encode_image(file_url)
 
         # Initialize LLM
         llm = ChatGoogleGenerativeAI(
@@ -480,7 +597,7 @@ async def run_report_analysis_task(job_id: str, file_url: str):
         # --- STAGE 1: MULTIMODAL CLINICAL EXTRACTION ---
         logger.info(f"Job {job_id} [Stage 1]: Running Multimodal Self-Healing Extraction...")
         system_prompt_extract = (
-            "You are an expert medical data extraction assistant and radiologist.\n"
+            "You are an expert medical data extraction assistant, lab biochemist, and radiologist.\n"
             "Your objective is to inspect the uploaded medical scan, lab report, or prescription sheet, "
             "and extract all relevant details into the requested structured JSON format.\n"
             "Follow these guidelines strictly:\n"
@@ -488,8 +605,9 @@ async def run_report_analysis_task(job_id: str, file_url: str):
             "2. Identify any clinical vitals (e.g., blood pressure BP, heart rate HR, temperature, respiratory rate, weight) and organize them into standard key-value pairs.\n"
             "3. List all distinct diagnoses, physical findings, or radiological anomalies observed in the document.\n"
             "4. Extract all prescribed medications, including exact dosages, frequencies, and directions.\n"
-            "5. Do NOT include any conversational text, introductory thoughts, or metadata. Output ONLY the verified medical data conforming strictly to the requested schema.\n"
-            "6. If the image is completely illegible or unrelated to medical files, raise a clinical warning in the diagnoses and return empty parameters for other fields.\n\n"
+            "5. EXTRACT LAB TEST RESULTS: Identify all numerical laboratory results (e.g. Hemoglobin, WBC count, Sodium, Potassium, TSH, HbA1c, Cholesterol) with their value, unit, and referenced normal range. Compare the reading value against the reference range and determine if the status is exactly 'Low', 'Normal', or 'High'. Organize this strictly in the lab_results schema array.\n"
+            "6. Do NOT include any conversational text, introductory thoughts, or metadata. Output ONLY the verified medical data conforming strictly to the requested schema.\n"
+            "7. If the image is completely illegible or unrelated to medical files, raise a clinical warning in the diagnoses and return empty parameters for other fields.\n\n"
             f"{parser_extract.get_format_instructions()}"
         )
 
@@ -497,7 +615,7 @@ async def run_report_analysis_task(job_id: str, file_url: str):
             ("system", system_prompt_extract),
             HumanMessage(
                 content=[
-                    {"type": "text", "text": "Analyze this medical document and extract all clinical metrics."},
+                    {"type": "text", "text": "Analyze this medical document and extract all clinical and laboratory metrics."},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:{mime_type};base64,{encoded_image}"}
@@ -512,7 +630,7 @@ async def run_report_analysis_task(job_id: str, file_url: str):
             parser=parser_extract,
             max_retries=2
         )
-        logger.info(f"Job {job_id} [Stage 1] complete. Patient name: '{extracted_data.patient_name}'")
+        logger.info(f"Job {job_id} [Stage 1] complete. Patient name: '{extracted_data.patient_name}', Lab readings extracted: {len(extracted_data.lab_results)}")
 
         # --- STAGE 2: CLINICAL SUMMARIZATION ---
         logger.info(f"Job {job_id} [Stage 2]: Running Layman Bullet Summarization...")
@@ -522,7 +640,7 @@ async def run_report_analysis_task(job_id: str, file_url: str):
             "patient-friendly, highly empathetic, and scannable clinical summary.\n"
             "Follow these guidelines strictly:\n"
             "1. Output a list of exactly 3 to 5 short, concise bullet points.\n"
-            "2. Translate complex medical terminology into clear, simple layman terms (e.g. explain what white matter changes, consolidations, or pleural effusions mean practically in plain, calm English).\n"
+            "2. Translate complex medical terminology into clear, simple layman terms (e.g. explain what white matter changes, consolidations, pleural effusions, or abnormal lab readings mean practically in plain, calm English).\n"
             "3. Optimize the text so it can be scanned and understood in under 5 seconds by busy medical staff or anxious patients.\n"
             "4. Do NOT include any conversational text, introductions, or structural metadata. Output only the bullet points conforming strictly to the MedicalSummaryPoints schema.\n\n"
             f"{parser_summarize.get_format_instructions()}"
@@ -554,6 +672,7 @@ async def run_report_analysis_task(job_id: str, file_url: str):
             "extracted_vitals": extracted_data.extracted_vitals,
             "diagnoses": extracted_data.diagnoses,
             "prescribed_medications": extracted_data.prescribed_medications,
+            "lab_results": [res.model_dump() for res in extracted_data.lab_results],
             "summary": bullets,
             "document_hash": file_hash,  # IMMUTABLE CRYPTOGRAPHIC FINGERPRINT
             "confidence_score": 0.98,
@@ -574,12 +693,14 @@ async def run_report_analysis_task(job_id: str, file_url: str):
         # Deploy high-fidelity fallback to ensure demonstration continuity
         logger.warning(f"Job {job_id}: Executing safety clinical fallback simulation...")
         try:
-            sim_data = get_simulated_clinical_extraction(file_url)
+            ref_url = file_url if file_url else "uploaded_scan_report.jpg"
+            sim_data = get_simulated_clinical_extraction(ref_url)
             final_response = {
                 "patient_name": sim_data["patient_name"],
                 "extracted_vitals": sim_data["extracted_vitals"],
                 "diagnoses": sim_data["diagnoses"],
                 "prescribed_medications": sim_data["prescribed_medications"],
+                "lab_results": sim_data["lab_results"],
                 "summary": sim_data["summary"],
                 "document_hash": sim_data["document_hash"],
                 "confidence_score": 0.88,
@@ -745,14 +866,13 @@ async def post_triage(payload: TriageRequest):
 @app.post("/api/analyze-report", response_model=AnalyzeQueuedResponse, status_code=status.HTTP_202_ACCEPTED)
 async def post_analyze_report(payload: AnalyzeRequest, background_tasks: BackgroundTasks):
     """
-    Asynchronous Event-Driven Report Analysis:
+    Asynchronous Event-Driven Report Analysis (URL Mode):
     Ingests report image URLs, registers/adopts a job ID, queues the self-healing 
     analysis pipeline onto BackgroundTasks, and immediately returns a 202 Accepted status.
     This guarantees 0 frontend lockups or request timeouts.
     """
-    # Adopt existing frontend row UUID if provided, otherwise generate a new one
     job_id = payload.job_id.strip() if payload.job_id else str(uuid.uuid4())
-    logger.info(f"Received analysis request. Registering Job ID: {job_id} [Async Queue]")
+    logger.info(f"Received URL analysis request. Registering Job ID: {job_id} [Async Queue]")
 
     if not payload.file_url.strip():
         raise HTTPException(
@@ -766,14 +886,177 @@ async def post_analyze_report(payload: AnalyzeRequest, background_tasks: Backgro
         "result": None
     }
 
-    # Queue actual clinical LangChain extraction task in the background worker
-    background_tasks.add_task(run_report_analysis_task, job_id, payload.file_url)
+    # Queue task with file_url
+    background_tasks.add_task(run_report_analysis_task, job_id, payload.file_url, None)
 
     return AnalyzeQueuedResponse(
         job_id=job_id,
         status="processing",
         message="Radiological report analysis successfully queued for background processing."
     )
+
+
+@app.post("/api/analyze-report/upload", response_model=AnalyzeQueuedResponse, status_code=status.HTTP_202_ACCEPTED)
+async def post_analyze_report_upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    job_id: Optional[str] = Form(None)
+):
+    """
+    Direct File Upload Endpoint (Feature Extraction Upgrade):
+    Accepts raw multipart file uploads (image/PDF). Reads the buffer directly, 
+    computes the Web3 SHA-256 integrity hash, base64-encodes the image, 
+    and offloads the structured parsing pipeline to BackgroundTasks, returning 202 immediately.
+    """
+    assigned_job_id = job_id.strip() if job_id else str(uuid.uuid4())
+    logger.info(f"Received file upload request. Assigned Job ID: {assigned_job_id} [Async File Queue]")
+
+    try:
+        # Read raw uploaded file buffer directly
+        contents = await file.read()
+        
+        # WEB3 Cryptographic document integrity hashing of the raw buffer
+        file_hash = hashlib.sha256(contents).hexdigest()
+        logger.info(f"Direct File Hashed. SHA-256 fingerprint: {file_hash}")
+        
+        # Verify valid image layout
+        img = Image.open(BytesIO(contents))
+        img.verify()
+        
+        mime_type = file.content_type or "image/jpeg"
+        encoded_image = base64.b64encode(contents).decode("utf-8")
+        
+        # Initialize task state in local store
+        JOBS_DB[assigned_job_id] = {
+            "status": "processing",
+            "result": None
+        }
+
+        # Pack pre-loaded image payload to bypass remote download requirement
+        image_data = {
+            "encoded_image": encoded_image,
+            "mime_type": mime_type,
+            "file_hash": file_hash
+        }
+
+        # Queue worker task with preloaded image buffer
+        background_tasks.add_task(run_report_analysis_task, assigned_job_id, None, image_data)
+
+        return AnalyzeQueuedResponse(
+            job_id=assigned_job_id,
+            status="processing",
+            message="Uploaded radiological file successfully hashed, encoded, and queued for clinical extraction."
+        )
+
+    except Exception as e:
+        logger.error(f"Direct file upload parsing failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Uploaded file validation or cryptographic sealing failed: {str(e)}"
+        )
+
+
+@app.post("/api/parse-prescription", response_model=PrescriptionExtractionResponse, status_code=status.HTTP_200_OK)
+async def post_parse_prescription(payload: AnalyzeRequest):
+    """
+    Dedicated Prescription OCR Verification Flow (Feature Extraction Upgrade):
+    Specialized endpoint focused strictly on pharmaceutical validation. Extracts 
+    doctors, patients, and structured medications lists (name, dosage, frequency, refills, durations, directions).
+    Includes self-healing auto-retry loops and simulated presets.
+    """
+    logger.info(f"Dedicated prescription parsing requested for: '{payload.file_url}'")
+    
+    if not payload.file_url.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Document reference URL cannot be empty."
+        )
+
+    # Use simulated fallback if API Key is not configured
+    if not GEMINI_API_KEY:
+        sim = get_simulated_prescription_extraction(payload.file_url)
+        return PrescriptionExtractionResponse(
+            patient_name=sim["patient_name"],
+            prescribing_doctor=sim["prescribing_doctor"],
+            medications=[PrescriptionMedication(**med) for med in sim["medications"]],
+            document_hash=sim["document_hash"],
+            pipeline_mode="simulated_fallback"
+        )
+
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.messages import HumanMessage
+        from langchain_core.output_parsers import PydanticOutputParser
+
+        # Download report image, fetch raw buffer, and compute Web3 document hash
+        encoded_image, mime_type, file_hash = await download_and_encode_image(payload.file_url)
+
+        # Initialize LLM
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.1
+        )
+
+        parser_rx = PydanticOutputParser(pydantic_object=PrescriptionExtractionResponse)
+
+        # Stage 1: Running Multimodal Prescription Self-Healing Extraction
+        logger.info("Executing Prescription Pipeline: Running Multimodal Self-Healing Extraction...")
+        system_prompt_rx = (
+            "You are an expert clinical pharmacist, prescription verification coordinator, and medical extractor.\n"
+            "Your objective is to inspect the uploaded prescription sheet or medical order,\n"
+            "and extract all relevant details into the requested structured JSON format.\n"
+            "Follow these guidelines strictly:\n"
+            "1. Extract the patient's full name. If not visible, return 'Unknown'.\n"
+            "2. Extract the prescribing doctor's full name, credential status (e.g. Dr. Jane Doe, MD), and clinic if present.\n"
+            "3. EXTRACT PRESCRIBED MEDICATIONS LIST: Extract all medications listed on the sheet. For each medication, resolve the drug name, dosage (e.g. 500mg, 10ml), frequency (e.g. every 8 hours, at bedtime), duration, permitted refills counts (default to 0 if not specified), and special intake instructions.\n"
+            "4. Do NOT include any conversational text, introductory thoughts, or metadata. Output ONLY the verified medical data conforming strictly to the requested schema.\n"
+            "5. If the image is completely illegible or unrelated to prescription orders, return empty fields and flag it in the instructions.\n\n"
+            f"{parser_rx.get_format_instructions()}"
+        )
+
+        messages_rx = [
+            ("system", system_prompt_rx),
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": "Analyze this prescription and extract all structured medication metrics."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{encoded_image}"}
+                    }
+                ]
+            )
+        ]
+
+        extracted_rx: PrescriptionExtractionResponse = await invoke_with_retry_and_parsing(
+            llm=llm,
+            prompt_messages=messages_rx,
+            parser=parser_rx,
+            max_retries=2
+        )
+
+        logger.info(f"Prescription parsed successfully for patient '{extracted_rx.patient_name}', medications found: {len(extracted_rx.medications)}")
+        return PrescriptionExtractionResponse(
+            patient_name=extracted_rx.patient_name,
+            prescribing_doctor=extracted_rx.prescribing_doctor,
+            medications=extracted_rx.medications,
+            document_hash=file_hash,
+            pipeline_mode="live_gemini_vision"
+        )
+
+    except Exception as e:
+        logger.error(f"Live prescription pipeline failed: {str(e)}")
+        logger.warning("Failing over to High-Fidelity Prescription Simulator Mode to prevent endpoint failure.")
+        
+        sim = get_simulated_prescription_extraction(payload.file_url)
+        return PrescriptionExtractionResponse(
+            patient_name=sim["patient_name"],
+            prescribing_doctor=sim["prescribing_doctor"],
+            medications=[PrescriptionMedication(**med) for med in sim["medications"]],
+            document_hash=sim["document_hash"],
+            pipeline_mode="simulated_fallback"
+        )
 
 
 @app.get("/api/analyze-report/status/{job_id}", status_code=status.HTTP_200_OK)
