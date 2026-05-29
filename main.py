@@ -35,6 +35,8 @@ app = FastAPI(
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://medi-scan-frontend-rk6w.vercel.app",
+    "https://medi-scan-frontend-rk6w.vercel.app/",
 ]
 
 app.add_middleware(
